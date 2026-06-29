@@ -341,8 +341,8 @@ def _load_quarter(
     idx = idx_all[idx_all["issuer_cik"].isin(ciks)] if ciks is not None else idx_all
     rows = list(idx.itertuples(index=False))
     log.info(
-        "%dQ%d: fetching %d filings (%d after CIK filter of %d listed) with %d workers",
-        year, qtr, len(rows), len(idx), len(ciks) if ciks is not None else 0, len(idx_all),
+        "%dQ%d: index has %d Form 4 filings; %d from %d listed issuers; fetching with %d workers",
+        year, qtr, len(idx_all), len(idx), len(ciks) if ciks is not None else 0, workers,
     )
 
     records: list[dict] = []
