@@ -1,0 +1,86 @@
+name: build-form4
+
+# Fans the EDGAR Form 4 parse across one runner per quarter (each a distinct IP under SEC's
+# per-IP rate limit), then bundles the per-quarter parquet caches into one downloadable
+# artifact. Public repo -> free unlimited standard-runner minutes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Sample start (YYYY-MM-DD)"
+        default: "2003-01-01"
+
+permissions:
+  contents: read
+
+env:
+  SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT }}
+  FORM4_CACHE_DIR: ${{ github.workspace }}/data/edgar/form4
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      quarters: ${{ steps.gen.outputs.quarters }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - id: gen
+        run: echo "quarters=$(python build_data.py --list-quarters --start '${{ inputs.start }}')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: list
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        quarter: ${{ fromJson(needs.list.outputs.quarters) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Restore a previously-built quarter so reruns skip finished work.
+      - uses: actions/cache@v4
+        with:
+          path: data/edgar/form4/${{ matrix.quarter }}.parquet
+          key: form4-${{ matrix.quarter }}-v1
+      - name: Build ${{ matrix.quarter }}
+        run: python build_data.py --quarter '${{ matrix.quarter }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: q-${{ matrix.quarter }}
+          path: data/edgar/form4/${{ matrix.quarter }}.parquet
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: q-*
+          path: quarters
+          merge-multiple: true
+      - name: Bundle the per-quarter parquet caches
+        run: |
+          mkdir -p out
+          find quarters -name '*.parquet' -exec cp {} out/ \;
+          ls -la out
+          tar -C out -czf form4_cache.tar.gz .
+          echo "bundled $(ls out | wc -l) quarter parquets"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: form4_cache
+          path: form4_cache.tar.gz
+          retention-days: 7
