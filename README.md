@@ -1,4 +1,4 @@
-# edgar-form4-fetch
+# edgar-fetch
 
 Cloud **matrix** for parsing SEC EDGAR filings into per-quarter parquet caches.
 
