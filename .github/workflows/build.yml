@@ -1,8 +1,12 @@
 name: build-form4
 
-# Fans the EDGAR Form 4 parse across one runner per quarter (each a distinct IP under SEC's
-# per-IP rate limit), then bundles the per-quarter parquet caches into one downloadable
-# artifact. Public repo -> free unlimited standard-runner minutes.
+# Fans the EDGAR Form 4 parse across one runner per quarter, then bundles the per-quarter
+# parquet caches into one downloadable artifact. Public repo -> free unlimited standard-runner
+# minutes. NOTE: GitHub runners share Azure egress IPs, so concurrent jobs can collide on one
+# IP and trip SEC's 10 req/s per-IP limit -> 429s and, if sustained, a soft-ban of that IP.
+# max-parallel is kept low to limit collisions; the fetcher honors Retry-After + exponential
+# backoff and refuses to cache a quarter that lost >5% of fetches (see form4.py). Use the
+# `quarters` input to surgically rebuild only the quarters that came back holed.
 
 on:
   workflow_dispatch:
@@ -12,6 +16,9 @@ on:
         default: "2003-01-01"
       end:
         description: "Sample end (YYYY-MM-DD); blank = today"
+        default: ""
+      quarters:
+        description: 'Explicit JSON list to (re)build, e.g. ["2015Q4","2020Q1"]; blank = full start/end range'
         default: ""
 
 permissions:
@@ -34,17 +41,28 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - id: gen
+        env:
+          QUARTERS: ${{ inputs.quarters }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
         run: |
-          END_ARG=""
-          if [ -n "${{ inputs.end }}" ]; then END_ARG="--end ${{ inputs.end }}"; fi
-          echo "quarters=$(python build_data.py --list-quarters --start '${{ inputs.start }}' $END_ARG)" >> "$GITHUB_OUTPUT"
+          if [ -n "$QUARTERS" ]; then
+            # Targeted rebuild: use the explicit quarter list verbatim.
+            echo "quarters=$QUARTERS" >> "$GITHUB_OUTPUT"
+          else
+            END_ARG=""
+            if [ -n "$END" ]; then END_ARG="--end $END"; fi
+            echo "quarters=$(python build_data.py --list-quarters --start "$START" $END_ARG)" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: list
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 40
+      # Low to limit shared-egress-IP collisions against SEC's per-IP rate limit. Public-repo
+      # runner minutes are free, so the wall-clock cost of less parallelism is irrelevant.
+      max-parallel: 12
       matrix:
         quarter: ${{ fromJson(needs.list.outputs.quarters) }}
     steps:
@@ -58,7 +76,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: data/edgar/form4/${{ matrix.quarter }}.parquet
-          key: form4-${{ matrix.quarter }}-v1
+          # -v2: busts the v1 caches so the holed 2015Q4/2020Q1/2019Q1/2022Q4 quarters
+          # actually refetch instead of restoring their incomplete parquet.
+          key: form4-${{ matrix.quarter }}-v2
       - name: Build ${{ matrix.quarter }}
         run: python build_data.py --quarter '${{ matrix.quarter }}'
       - uses: actions/upload-artifact@v4

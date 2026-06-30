@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -49,8 +50,19 @@ _USER_AGENT = os.environ.get(
     "SEC_USER_AGENT", "chakravarti-research harrisonrustan@gmail.com"
 )
 _MIN_INTERVAL = 0.11  # seconds between requests globally (~9/s, under SEC's 10/s ceiling)
-_RETRIES = 4
+_RETRIES = 6
 _WORKERS = 10  # concurrent fetchers; the shared throttle still caps the aggregate rate
+# Backoff on 403/429/5xx: honor SEC's Retry-After header when present, else exponential
+# with jitter (capped). Jitter desynchronizes concurrent workers so they don't retry in
+# lockstep against a still-throttled IP; the longer ceiling lets a runner ride out a
+# transient per-IP throttle instead of burning all its retries while the IP stays hot.
+_BACKOFF_BASE = 1.0
+_BACKOFF_CAP = 30.0
+_BACKOFF_JITTER = 0.5
+# Refuse to cache a quarter that lost more than this fraction of its fetches. A holed
+# parquet that still exits 0 is the silent-corruption mode (e.g. a mid-run IP soft-ban);
+# failing loud keeps it out of the bundle. Overridable via FORM4_MAX_FAIL_FRAC.
+_MAX_FAIL_FRAC = float(os.environ.get("FORM4_MAX_FAIL_FRAC", "0.05"))
 _LOG_EVERY = int(os.environ.get("FORM4_LOG_EVERY", "200"))  # heartbeat cadence (filings)
 _LOG_PURCHASES = os.environ.get("FORM4_LOG_PURCHASES", "1") not in ("0", "false", "False")
 
@@ -116,16 +128,23 @@ def _get(session, throttle: _Throttle, url: str) -> str | None:
             r = session.get(url, timeout=60)
         except Exception as e:
             log.debug("network error (attempt %d) on %s: %s", attempt + 1, url, e)
-            time.sleep(0.5 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1) + random.uniform(0, _BACKOFF_JITTER))
             continue
         if r.status_code == 200:
             return r.text
         if r.status_code in (403, 429) or r.status_code >= 500:
             # Rate-limited / server error: back off and retry. Surfaced so the runner log
-            # shows when SEC is throttling us.
-            log.warning("HTTP %d (attempt %d/%d), backing off: %s",
-                        r.status_code, attempt + 1, _RETRIES, url)
-            time.sleep(1.0 * (attempt + 1))
+            # shows when SEC is throttling us. Honor Retry-After when SEC sends it; else
+            # exponential backoff with jitter, capped.
+            ra = r.headers.get("Retry-After", "")
+            if ra.strip().isdigit():
+                delay = float(ra.strip())
+            else:
+                delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
+            delay += random.uniform(0, _BACKOFF_JITTER)
+            log.warning("HTTP %d (attempt %d/%d), backing off %.1fs: %s",
+                        r.status_code, attempt + 1, _RETRIES, delay, url)
+            time.sleep(delay)
             continue
         log.debug("HTTP %d (no retry): %s", r.status_code, url)
         return None  # 404 etc. -> nothing to retry
@@ -375,6 +394,15 @@ def _load_quarter(
         "%dQ%d: DONE -> %d purchase rows from %d filings (%d failed) in %.0fs",
         year, qtr, len(df), n_fetch, n_fail, time.monotonic() - t0,
     )
+    # Fail loud rather than cache a holed quarter. n_fail counts filings that exhausted all
+    # retries (e.g. a sustained per-IP throttle); above the cap the parquet is materially
+    # incomplete and must not masquerade as a successful build.
+    frac = n_fail / n_fetch if n_fetch else 0.0
+    if frac > _MAX_FAIL_FRAC:
+        raise RuntimeError(
+            f"{year}Q{qtr}: {n_fail}/{n_fetch} fetches failed ({frac:.1%} > "
+            f"{_MAX_FAIL_FRAC:.0%} cap); refusing to cache an incomplete quarter"
+        )
     cache.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache)
     return df
